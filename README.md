@@ -1,70 +1,155 @@
-# MMBC Actuator PLC — Raspberry Pi OpenPLC Research Repo
+# Raspberry Pi as an Industrial PLC — Latency and Jitter Benchmarks
 
-This is my working documentation for an ongoing research project where I'm turning a Raspberry Pi into a software PLC using OpenPLC, then using it to test actuator response times and sensor integration.
+Measuring whether a Raspberry Pi 4 running OpenPLC can meet the timing
+requirements normally expected of an industrial PLC.
 
-This repo is a living document with setup guides, experiment logs, issues I ran into, and results. It's meant to be readable for someone starting from scratch with this hardware/software stack.
+A real PLC is judged on *predictability*, not average speed. A controller with a
+0.8 ms mean and a 5 ms worst case is a different machine from one with a 0.8 ms
+mean and a 0.1 ms standard deviation, even though the headline number is the
+same. These experiments measure the whole distribution, not the average.
+
+The work was done at Fermilab as part of the controls effort for MAMBA, a rapid
+cycling bubble chamber prototype for the DUNE collaboration. The eventual target
+is a Pi-based PLC driving a linear actuator and reading cryogenic sensors, so the
+question is not academic.
 
 ---
 
-## What's in here
+## Results so far
+
+**Modbus round-trip latency, 1.0 ms scan cycle, n = 20,000**
+
+| | ms |
+|---|---|
+| Minimum | 0.133 |
+| Floor (10th percentile) | 0.298 |
+| Median | 0.639 |
+| Mean | 0.585 |
+| Standard deviation | 0.177 |
+| 99th percentile | 0.898 |
+| 99.9th percentile | 1.164 |
+| **Maximum** | **1.285** |
+
+Samples exceeding the 1.0 ms cycle time: 131, or 0.66%.
+
+The number that matters is the maximum. **Across 20,000 consecutive samples at a
+1 ms scan cycle, nothing took longer than 1.285 ms.** The tail is bounded. That
+is a much stronger statement than the mean, and it is the statement a controls
+engineer actually needs.
+
+**The 3.6 ms spike did not reproduce.** An earlier 28-sample test with a PT100
+sensor in the loop recorded a single 3.643 ms outlier, which I assumed at the time
+was the OS scheduler preempting the PLC process. Removing the sensor and running
+20,000 samples put a hard ceiling at 1.285 ms. The spike was in the SPI sensor
+read, not in the scheduler. Isolating the signal path was the point of this
+experiment and it paid off.
+
+**MAX31865 conversion rate verified.** Measured interval between conversions in
+continuous mode: 16.689 ms mean over 100 pulses (σ = 1.524 ms), which is 59.92 Hz
+against a nominal 60 Hz. The amplifier does what it claims.
+
+**PT100 thermal response dominates everything.** A step change reached 63.2% in
+2.42 s and 90% in 7.86 s, so the sensor time constant is about 2.4 s. That is
+145× slower than the conversion time and roughly 4,000× slower than the Modbus
+round trip. For any thermal control loop built on this hardware, the probe is the
+bottleneck and the electronics are free.
+
+---
+
+## What is measured, exactly
 
 ```
-MMBC-Actuator-PLC/
-│
-├── setup/                        # Step-by-step setup guides (do these first)
-│   
-├── experiments/                  # My R&D logs for each experiment
-│
-├── scripts/                      # Python scripts used in experiments
-│
-├── issues/                       # Known issues & fixes in one place
-│   
-└── README.md                     
+Python writes holding register (%QW0 = 1)
+    -> OpenPLC scan cycle picks it up
+        -> PLC logic sets coil (%QX0.0 = TRUE)
+            -> Python reads the coil back over Modbus
 ```
 
+Nothing else. No sensor, no GPIO, no human. The ST program is deliberately
+trivial — it mirrors a register to a coil — so that what gets measured is
+communication plus scan overhead and not program execution.
+
+Three numbers come out of the distribution and each means something different:
+
+- **Floor** — fixed cost of two Modbus TCP transactions plus Python. Irreducible
+  with this software stack no matter how low the scan cycle goes.
+- **Typical spread** — floor up to floor plus one cycle time. This is
+  quantization: the trigger lands at a random point inside the scan window.
+- **Tail beyond one cycle** — the PLC missed a scan. This is the jitter rate, and
+  it is the number that decides whether the Pi is usable for a given application.
+
+The expected mean is floor + cycle_time/2. Measured mean minus floor is 0.287 ms
+against an expected 0.5 ms, which suggests the trigger is not landing uniformly
+in the scan window. I don't have an explanation for that yet.
+
 ---
 
-## Where to start
+## Repository layout
 
-If you're new to this setup, work through the **setup/** folder in order:
+```
+setup/          Build the rig from a blank SD card. Do these in order.
+experiments/    One markdown log per experiment: method, results, diagnosis.
+scripts/        The Python used to run each experiment.
+data/           Raw CSV output and figures.
+issues/         Every bug worth remembering, with root cause and fix.
+```
 
-1. [Raspberry Pi SSH Setup](setup/1-raspberry-pi-ssh-setup.md) — flash the OS, connect to the Fermilab network, SSH in
-2. [OpenPLC Runtime Setup](setup/2-openplc-runtime-setup.md) — install and start the OpenPLC runtime on the Pi
-3. [Example PLC Program](setup/3-example-raspberry-pi-plc.md) — build and run a simple button → LED program as a sanity check
-
-Once setup is done, the **experiments/** folder has some R&D work I've been doing.
-
----
-
-## Known Issues
-
-All issues/bugs are collected in [issues/KNOWN_ISSUES.md](issues/KNOWN_ISSUES.md).
+Start in [setup/](setup/) if you are reproducing this from scratch. The three
+guides take you from flashing an SD card to a working button-and-LED ladder
+program, which is the sanity check everything else assumes.
 
 ---
 
-## Hardware used
-- Raspberry Pi 4
-- Adafruit MAX31865 RTD amplifier
-- PT100 RTD (4-wire)
-- Breadboard, jumper wires, 220Ω & 10kΩ resistors, pushbutton, LED
+## Open questions
+
+These are the experiments I have not run yet, roughly in order of how much they
+would change the conclusion.
+
+**Scan cycle floor.** Below 1 ms the OpenPLC program stops compiling. Mapping
+where it becomes unstable, starts missing cycles, or refuses outright is the
+single most important remaining measurement for the "can a Pi be a PLC" question.
+Worth sweeping 0.5 ms through 50 ms and recording the failure mode at each step.
+
+**Jitter versus scan cycle.** The 0.66% overrun rate at 1 ms is one point on a
+curve. Does it get worse as the cycle shortens? That curve is the real answer.
+
+**Behaviour under CPU load.** An industrial PLC has dedicated hardware. A Pi
+shares a CPU with a general-purpose OS. Running a stress test in a second
+terminal and re-measuring would show whether the bounded tail survives contention,
+and I suspect this is the Pi's real weakness.
+
+**PREEMPT_RT.** Raspberry Pi OS is not a real-time OS, so the scheduler can
+preempt the runtime at any point. There is a PREEMPT_RT kernel patch for the Pi.
+Measuring with and without it would isolate how much of the jitter is the OS and
+how much is the software stack.
+
+**Network baseline.** Raw ICMP ping between the two machines sets a floor for
+what Modbus TCP can achieve independent of PLC overhead. Cheap to measure, and it
+would tell me how much of the 0.298 ms floor is network versus Python.
+
+**C++ runtime.** Python's `pymodbus` is convenient and slow. Whether a C++ client
+moves the floor is worth knowing, though it would not touch the scan-cycle
+quantization that dominates the spread.
+
+**Comparison against a commercial PLC.** Everything above is only meaningful
+relative to what a Beckhoff or Siemens unit does on the same test.
+
+---
+
+## Hardware
+
+- Raspberry Pi 4, Raspberry Pi OS Bookworm 64-bit
+- Adafruit MAX31865 RTD-to-digital amplifier (SPI)
+- PT100 RTD, 4-wire
+- Breadboard, pushbutton, LED, 220 Ω and 10 kΩ resistors
 
 ## Software
-- Raspberry Pi OS Bookworm 64-bit
-- OpenPLC Runtime v3
-- OpenPLC Editor 
-- Python 3 (`adafruit-blinka`, `adafruit-circuitpython-max31865`, `pymodbus`, `RPi.GPIO`)
 
-## Log
-Things I want to test/learn:
-1. Real-time kernel, the Raspberry Pi OS is not a real-time OS, which means the scheduler can preempt your process at any time. There's a PREEMPT_RT kernel patch for Raspberry Pi that converts it to a real-time kernel, which could dramatically reduce the jitter. Testing with and without it could be worth looking at. (Raspberry Pi 5 does thia automatically)
-2. Openplc button response time test with a new, decreased cycle time. Need to setup SSH again before I do this because if its all on the same device running the test script and the OpenPLC runtime on the same Pi means the runtime's hardware layer claims the GPIO pins at startup, which kills the test script's access. SSHing in from a second machine lets you run the test script from outside while the runtime stays untouched on the Pi.
-3. Possibly switching to C++, harder/longer code but it does cycle much faster than python. I can use Claude to translate the code. I would need to see if C++ has a modbus server like Python's pymodbus.
-4. Scan cycle floor mapping. So far, whenever I have tried to lower the cycle time under 1ms, the code will not compile. If we want enough data to publish, it's worth testing the cycle times from 1-50 or 100 and understand and record where it becomes unstable, misses cycles, or crashes. This is probably the most important single experiment for the "can a Pi 4 be an industrial PLC" question.
-5. Jitter characterization, the mean latency alone is not enough for arguing its use as an industrial PLC. A real PLC needs consistent and predictable response times. So I want to measure standard deviation and worst-case latency across thousands of samples at each scan cycle setting. A Pi hitting 0.8ms mean but 5ms worst-case is very different from one hitting 0.8ms mean with 0.1ms std dev.
-6. Might as well test the network latency baseline by measuring raw ping latency between the two machines on the local network. That gives a floor for what Modbus TCP over the network can possibly achieve, separate from PLC overhead.
-7. Compare results to commercial PLC's to compare consistency.
-8. It could be nothing, but industrial PLCs have dedicated hardware whereas the Pi shares the CPU load with an OS. It would be worth running a stress test in another terminal to see if response time degrades under load or refuses to work at all. This might be a big weakness of a Pi PLC.
+- OpenPLC Runtime v3 on the Pi, web UI on port 8080, Modbus TCP on port 502
+- OpenPLC Editor on a laptop, Structured Text
+- Python 3 with `pymodbus`, `adafruit-blinka`,
+  `adafruit-circuitpython-max31865`, `RPi.GPIO`
 
----
-
-> The goal is eventually to use a Pi-based PLC to control an actuator & sensors in a real system, these experiments are building toward that.
+Bookworm ships with a pip guard; installs need `--break-system-packages` or a
+virtual environment. That and five other things that cost me time are written up
+in [issues/KNOWN_ISSUES.md](issues/KNOWN_ISSUES.md).
